@@ -64,6 +64,14 @@ python src/alpamayo_r1/test_inference.py
 In case you would like to obtain more trajectories and reasoning traces, please feel free to change
 the `num_traj_samples=1` argument to a higher number (Line 60).
 
+### Quantization
+
+Please install Torch-Tensorrt and ModelOpt before running the script. To see the usage of the arguments, 
+please refer to ./src/alpamayo_r1/eval.py for details.
+```bash
+PYTHONPATH=src python src/alpamayo_r1/eval.py --compile_trt  # --limit 1 --num_traj_samples 1
+```
+
 ### Interactive notebook
 
 We provide a notebook with similar inference code at `notebook/inference.ipynb`.
