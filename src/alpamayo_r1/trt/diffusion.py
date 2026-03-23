@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -212,6 +213,46 @@ def _make_sample_inputs(
     return sample_inputs, dynamic_shapes, make_inputs
 
 
+def _quantize_fused_diffusion_step_module(
+    module: nn.Module,
+    make_inputs: callable,
+    min_prefix_len: int,
+    max_prefix_len: int,
+    quantization_args: Any,
+) -> nn.Module:
+    """
+    Quantize the fused denoiser (action_in_proj + expert + action_out_proj).
+
+    Calibration uses representative denoiser inputs across min/opt/max prefix
+    lengths and samples t in [0, 1] with the expected shape [B, 1, 1].
+    """
+    from alpamayo_r1.trt import quantize_utils
+
+    opt_prefix_len = (min_prefix_len + max_prefix_len) // 2
+    calib_prefix_lengths = [min_prefix_len, opt_prefix_len, max_prefix_len]
+    seen = set()
+    unique_prefix_lengths = []
+    for prefix_len in calib_prefix_lengths:
+        if prefix_len not in seen:
+            unique_prefix_lengths.append(prefix_len)
+            seen.add(prefix_len)
+
+    def _calibration_loop(diffusion_step_module: nn.Module) -> None:
+        with torch.no_grad():
+            for prefix_len in unique_prefix_lengths:
+                x, _, prefix_k, prefix_v, position_ids, attention_mask = make_inputs(prefix_len)
+                t = torch.rand((x.shape[0], 1, 1), dtype=x.dtype, device=x.device)
+                diffusion_step_module(x, t, prefix_k, prefix_v, position_ids, attention_mask)
+
+    logger.info("Quantizing fused diffusion step module before TRT export...")
+    quantized_module = quantize_utils.quantize_model(
+        module,
+        quantization_args,
+        calibration_forward_loop=_calibration_loop,
+    )
+    return quantized_module.eval()
+
+
 def _export_diffusion_module(
     module: nn.Module,
     sample_inputs: tuple,
@@ -269,6 +310,7 @@ def compile_diffusion_step_no_cache(
     offload_module_to_cpu: bool = False,
     debug: bool = False,
     accuracy_check: bool = True,
+    quantization_args: Any | None = None,
 ) -> nn.Module:
     """
     Compile the fused diffusion step with a dynamic VLM KV prefix length.
@@ -286,6 +328,9 @@ def compile_diffusion_step_no_cache(
                         Pass-through to torch_tensorrt.dynamo.compile
         debug:          Enable TRT debug logging
         accuracy_check: Compare TRT vs PyTorch on sample inputs after compilation
+        quantization_args:
+                        ModelOpt quantization args namespace. When provided,
+                        quantize the fused diffusion step module before export.
 
     Returns:
         TRT-compiled callable, also stored as model._trt_diffusion_step_no_cache
@@ -307,6 +352,14 @@ def compile_diffusion_step_no_cache(
     sample_inputs, dynamic_shapes, make_inputs = _make_sample_inputs(
         cfg, min_prefix_len, max_prefix_len, dtype, device, batch_size
     )
+    if quantization_args is not None:
+        module = _quantize_fused_diffusion_step_module(
+            module=module,
+            make_inputs=make_inputs,
+            min_prefix_len=min_prefix_len,
+            max_prefix_len=max_prefix_len,
+            quantization_args=quantization_args,
+        )
 
     ref_output = None
     if accuracy_check:

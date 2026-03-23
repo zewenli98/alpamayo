@@ -68,7 +68,7 @@ def load_physical_aiavdataset(
             - clip_id: The clip ID
     """
     if avdi is None:
-        avdi = physical_ai_av.PhysicalAIAVDatasetInterface()
+        avdi = physical_ai_av.PhysicalAIAVDatasetInterface(revision='2ae73f49ffd2b5db43b404201beb7b92889f7afc')
 
     if camera_features is None:
         camera_features = [

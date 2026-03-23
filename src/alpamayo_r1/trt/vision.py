@@ -338,6 +338,33 @@ def _prepare_vision_module(
     return wrapped, pixel_values, image_grid_thw
 
 
+def _quantize_vision_module(
+    wrapped: nn.Module,
+    pixel_values: torch.Tensor,
+    quantization_args: Any,
+) -> nn.Module:
+    """
+    Quantize VisualFixedGrid with representative visual calibration inputs.
+    """
+    from alpamayo_r1.trt import quantize_utils
+
+    def _calibration_loop(vision_module: nn.Module) -> None:
+        with torch.no_grad():
+            base = pixel_values
+            jitter = base + 0.01 * torch.randn_like(base)
+            scaled = base * 0.5
+            for sample in (base, jitter, scaled):
+                vision_module(sample, None)
+
+    logger.info("Quantizing vision wrapper before TRT export...")
+    quantized = quantize_utils.quantize_model(
+        wrapped,
+        quantization_args,
+        calibration_forward_loop=_calibration_loop,
+    )
+    return quantized.eval()
+
+
 def _export_vision_module(
     module: nn.Module,
     inputs: tuple,
@@ -367,6 +394,7 @@ def compile_vision_model(
     device: str = "cuda",
     debug: bool = False,
     offload_module_to_cpu: bool = False,
+    quantization_args: Any | None = None,
 ) -> nn.Module | None:
     """
     Compile the Qwen3VL vision encoder with TRT.
@@ -389,6 +417,10 @@ def compile_vision_model(
     wrapped, pixel_values, image_grid_thw = _prepare_vision_module(
         visual_model, model_inputs, device
     )
+
+    if quantization_args is not None:
+        wrapped = _quantize_vision_module(wrapped, pixel_values, quantization_args)
+
     logger.info(f"  pixel_values shape: {pixel_values.shape}")
     logger.info(f"  image_grid_thw:     {image_grid_thw}")
 
@@ -450,6 +482,7 @@ def compile_and_replace_vision_model(
     device: str = "cuda",
     debug: bool = False,
     offload_module_to_cpu: bool = False,
+    quantization_args: Any | None = None,
 ) -> bool:
     """
     Compile the vision model and hot-swap it into the Alpamayo model.
@@ -463,6 +496,7 @@ def compile_and_replace_vision_model(
         model.vlm.model.visual, model_inputs,
         device=device, debug=debug,
         offload_module_to_cpu=offload_module_to_cpu,
+        quantization_args=quantization_args,
     )
     if compiled is None:
         logger.error("Vision model compilation failed")

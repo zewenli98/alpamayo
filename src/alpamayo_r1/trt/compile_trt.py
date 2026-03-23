@@ -58,6 +58,14 @@ def compile_vision_trt(
     logger.info("=" * 60)
 
     from alpamayo_r1.trt.vision import compile_vision_model
+    import argparse
+
+    quantization_args = argparse.Namespace(
+        quant_format="fp8",
+        quant_algo="max",
+        weight_only=True,
+        debug=True,
+    )
 
     trt_vision = compile_vision_model(
         model.vlm.model.visual,
@@ -65,6 +73,7 @@ def compile_vision_trt(
         device="cuda",
         debug=False,
         offload_module_to_cpu=offload_module_to_cpu,
+        quantization_args=quantization_args,
     )
     if trt_vision is None:
         logger.error("Vision TRT compilation failed")
@@ -85,6 +94,13 @@ def compile_diffusion_no_cache_trt(
     logger.info("=" * 60)
 
     from alpamayo_r1.trt.diffusion import compile_diffusion_step_no_cache
+    import argparse
+    quantization_args = argparse.Namespace(
+        quant_format="fp8",
+        quant_algo="max",
+        weight_only=True,
+        debug=True,
+    )
 
     compile_diffusion_step_no_cache(
         model,
@@ -94,6 +110,7 @@ def compile_diffusion_no_cache_trt(
         offload_module_to_cpu=offload_module_to_cpu,
         debug=False,
         accuracy_check=True,
+        quantization_args=quantization_args,
     )
     if not hasattr(model, "_trt_diffusion_step_no_cache"):
         logger.error("No-cache diffusion TRT compilation failed")
@@ -115,6 +132,14 @@ def compile_language_trt(
     logger.info("=" * 60)
 
     from alpamayo_r1.trt.lm_with_cache import compile_vlm_lm_trt_with_cache
+    import argparse
+
+    quantization_args = argparse.Namespace(
+        quant_format="fp8",
+        quant_algo="max",
+        weight_only=True,
+        debug=True,
+    )
 
     compiled_model = compile_vlm_lm_trt_with_cache(
         model,
@@ -125,6 +150,7 @@ def compile_language_trt(
         offload_module_to_cpu=offload_module_to_cpu,
         debug=False,
         accuracy_check=True,
+        quantization_args=quantization_args,
     )
     model._trt_vlm_backbone = compiled_model
     model._trt_lm_max_batch_size = int(batch_size)
@@ -208,7 +234,9 @@ def compile_trt_modules(
     logger.info(f"  using max_prefix_len     = {prefix_seq_len}")
 
     model_inputs = create_inputs_fn()
+
     trt_vision = None
+    ############### compile vision model ###############
     trt_vision = compile_vision_trt(
         model,
         model_inputs,
@@ -216,6 +244,7 @@ def compile_trt_modules(
     )
     if trt_vision is None:
         logger.error("Failed to compile vision model")
+    ####################################################
 
     lm_seq_len = (
         int(prefix_seq_len + max_generation_length)
@@ -223,12 +252,13 @@ def compile_trt_modules(
         else int(lm_max_seq_len)
     )
     compile_inputs = create_inputs_fn()
-    compile_batch = max(2, int(compile_inputs["ego_history_xyz"].shape[0]) * int(num_traj_samples))
+    input_batch = int(compile_inputs["ego_history_xyz"].shape[0])
+    compile_batch = max(1, input_batch)  # reduce the batch size from 2 to 1 due to CUDA OOM error
     logger.info(f"  lm compile batch size   = {compile_batch}")
 
     
-    
     trt_lm = None
+    ############### compile language model ###############
     trt_lm = compile_language_trt(
         model,
         max_seq_len=lm_seq_len,
@@ -238,9 +268,11 @@ def compile_trt_modules(
     )
     if trt_lm is None:
         logger.error("Failed to compile language model")
+    ####################################################
 
 
     trt_diffusion = None
+    ############### compile diffusion model ###############
     diffusion_max_prefix_len = max(int(prefix_seq_len), int(lm_seq_len))
     logger.info(f"  diffusion max_prefix_len = {diffusion_max_prefix_len}")
     trt_diffusion = compile_diffusion_no_cache_trt(
@@ -253,6 +285,7 @@ def compile_trt_modules(
         logger.error("Failed to compile no-cache diffusion step")
     else:
         model._trt_diffusion_batch_size = int(compile_batch)
+    ####################################################
 
 
     return trt_vision, trt_lm, trt_diffusion, prefix_seq_len
@@ -305,164 +338,208 @@ def run_inference_trt(
             model.vlm.model.visual.forward = trt_vision.forward
 
         eos_token_id = model.tokenizer.convert_tokens_to_ids(to_special_token("traj_future_start"))
-        configure_generation(
-            model,
-            num_return_sequences=num_traj_samples,
-            max_new_tokens=max_generation_length,
-        )
-
-        stopping_criteria = StoppingCriteriaList([StopAfterEOS(eos_token_id=eos_token_id)])
-        logits_processor = LogitsProcessorList(
-            [
-                ExpertLogitsProcessor(
-                    traj_token_offset=model.config.traj_token_start_idx,
-                    traj_vocab_size=model.config.traj_vocab_size,
-                )
-            ]
-        )
-
-        vlm_outputs = model.vlm.generate(
-            input_ids=input_ids,
-            generation_config=model.vlm.generation_config,
-            stopping_criteria=stopping_criteria,
-            logits_processor=logits_processor,
-            **tokenized_data,
-        )
-        vlm_outputs.rope_deltas = model.vlm.model.rope_deltas
-
-        if original_vision_forward is not None:
-            model.vlm.model.visual.forward = original_vision_forward
-
-        vlm_outputs.sequences = replace_padding_after_eos(
-            token_ids=vlm_outputs.sequences,
-            eos_token_id=eos_token_id,
-            pad_token_id=model.tokenizer.pad_token_id,
-        )
-
-        b_star = vlm_outputs.sequences.shape[0]
         compiled_max_batch = getattr(
             model,
             "_trt_lm_max_batch_size",
             getattr(model, "_trt_lm_batch_size", None),
         )
-        if trt_lm is not None and compiled_max_batch is not None and int(b_star) > int(compiled_max_batch):
-            raise ValueError(
-                f"TRT LM batch mismatch: compiled max batch={compiled_max_batch}, runtime batch={b_star}. "
-                "Recompile TRT LM with a larger num_traj_samples/input batch."
-            )
-        traj_future_start_mask = vlm_outputs.sequences == eos_token_id
-        has_traj_future_start = traj_future_start_mask.any(dim=1)
-        traj_future_start_positions = traj_future_start_mask.int().argmax(dim=1)
-        last_token_positions = torch.full(
-            (b_star,), vlm_outputs.sequences.shape[1] - 1, device=device
-        )
-        valid_token_pos_id = torch.where(
-            has_traj_future_start, traj_future_start_positions, last_token_positions
-        )
-        offset = valid_token_pos_id + 1
 
-        n_diffusion_tokens = model.action_space.get_action_space_dims()[0]
-        prompt_cache = vlm_outputs.past_key_values
-        prefill_seq_len = prompt_cache.get_seq_length()
-
-        position_ids = torch.arange(n_diffusion_tokens, device=device)
-        position_ids = einops.repeat(position_ids, "l -> 3 b l", b=b_star).clone()
-        delta = vlm_outputs.rope_deltas + offset[:, None]
-        position_ids = position_ids + delta.to(device)
-
-        neg_inf = torch.finfo(dtype).min
-        attention_mask = torch.zeros(
-            b_star,
-            1,
-            n_diffusion_tokens,
-            prefill_seq_len + n_diffusion_tokens,
-            dtype=dtype,
-            device=device,
-        )
-        for i in range(b_star):
-            attention_mask[i, :, :, offset[i] : -n_diffusion_tokens] = neg_inf
-
-        prefix_k, prefix_v = stack_prefix_kv_from_cache(
-            prompt_cache,
-            device=torch.device(device),
-            dtype=dtype,
-        )
-        # Defensive cast to guarantee TRT KV input dtypes stay aligned.
-        prefix_k = prefix_k.to(device=device, dtype=dtype).contiguous()
-        prefix_v = prefix_v.to(device=device, dtype=dtype).contiguous()
-        prompt_cache = PrefixKVCache(prefix_k, prefix_v)
-        if trt_diffusion is not None:
-            logger.info(f"  prefix_k shape: {prefix_k.shape}")
-            if prefix_k.dtype != dtype or prefix_v.dtype != dtype:
-                raise TypeError(
-                    f"TRT KV dtype mismatch: expected {dtype}, got "
-                    f"prefix_k={prefix_k.dtype}, prefix_v={prefix_v.dtype}"
-                )
-            compiled_diff_batch = getattr(model, "_trt_diffusion_batch_size", None)
-            if compiled_diff_batch is not None and int(b_star) != int(compiled_diff_batch):
+        max_samples_per_call = int(num_traj_samples)
+        if trt_lm is not None and compiled_max_batch is not None:
+            if int(compiled_max_batch) < int(B):
                 raise ValueError(
-                    f"TRT diffusion batch mismatch: compiled batch={compiled_diff_batch}, runtime batch={b_star}. "
-                    "Recompile TRT diffusion with matching batch (input_batch * num_traj_samples)."
+                    f"TRT LM compiled max batch={compiled_max_batch} is smaller than input batch={B}"
+                )
+            max_samples_per_call = max(1, int(compiled_max_batch) // int(B))
+            if max_samples_per_call < int(num_traj_samples):
+                logger.info(
+                    "Chunking TRT LM generation: requested num_traj_samples=%d, max per call=%d",
+                    int(num_traj_samples),
+                    int(max_samples_per_call),
                 )
 
-        forward_kwargs = {}
-        if model.config.expert_non_causal_attention:
-            forward_kwargs["is_causal"] = False
+        def _run_single_chunk(chunk_samples: int) -> tuple[torch.Tensor, torch.Tensor, dict]:
+            configure_generation(
+                model,
+                num_return_sequences=int(chunk_samples),
+                max_new_tokens=max_generation_length,
+            )
 
-        if trt_diffusion is not None:
+            stopping_criteria = StoppingCriteriaList([StopAfterEOS(eos_token_id=eos_token_id)])
+            logits_processor = LogitsProcessorList(
+                [
+                    ExpertLogitsProcessor(
+                        traj_token_offset=model.config.traj_token_start_idx,
+                        traj_vocab_size=model.config.traj_vocab_size,
+                    )
+                ]
+            )
 
-            def step_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-                return trt_diffusion(
-                    x.to(dtype), t.to(dtype), prefix_k, prefix_v, position_ids, attention_mask
+            vlm_outputs = model.vlm.generate(
+                input_ids=input_ids,
+                generation_config=model.vlm.generation_config,
+                stopping_criteria=stopping_criteria,
+                logits_processor=logits_processor,
+                **tokenized_data,
+            )
+            vlm_outputs.rope_deltas = model.vlm.model.rope_deltas
+
+            vlm_outputs.sequences = replace_padding_after_eos(
+                token_ids=vlm_outputs.sequences,
+                eos_token_id=eos_token_id,
+                pad_token_id=model.tokenizer.pad_token_id,
+            )
+
+            b_star = vlm_outputs.sequences.shape[0]
+            if trt_lm is not None and compiled_max_batch is not None and int(b_star) > int(compiled_max_batch):
+                raise ValueError(
+                    f"TRT LM batch mismatch: compiled max batch={compiled_max_batch}, runtime batch={b_star}. "
+                    "Recompile TRT LM with a larger batch or lower num_traj_samples."
                 )
+            traj_future_start_mask = vlm_outputs.sequences == eos_token_id
+            has_traj_future_start = traj_future_start_mask.any(dim=1)
+            traj_future_start_positions = traj_future_start_mask.int().argmax(dim=1)
+            last_token_positions = torch.full(
+                (b_star,), vlm_outputs.sequences.shape[1] - 1, device=device
+            )
+            valid_token_pos_id = torch.where(
+                has_traj_future_start, traj_future_start_positions, last_token_positions
+            )
+            offset = valid_token_pos_id + 1
+
+            n_diffusion_tokens = model.action_space.get_action_space_dims()[0]
+            prompt_cache = vlm_outputs.past_key_values
+            prefill_seq_len = prompt_cache.get_seq_length()
+
+            position_ids = torch.arange(n_diffusion_tokens, device=device)
+            position_ids = einops.repeat(position_ids, "l -> 3 b l", b=b_star).clone()
+            delta = vlm_outputs.rope_deltas + offset[:, None]
+            position_ids = position_ids + delta.to(device)
+
+            neg_inf = torch.finfo(dtype).min
+            attention_mask = torch.zeros(
+                b_star,
+                1,
+                n_diffusion_tokens,
+                prefill_seq_len + n_diffusion_tokens,
+                dtype=dtype,
+                device=device,
+            )
+            for i in range(b_star):
+                attention_mask[i, :, :, offset[i] : -n_diffusion_tokens] = neg_inf
+
+            prefix_k, prefix_v = stack_prefix_kv_from_cache(
+                prompt_cache,
+                device=torch.device(device),
+                dtype=dtype,
+            )
+            # Defensive cast to guarantee TRT KV input dtypes stay aligned.
+            prefix_k = prefix_k.to(device=device, dtype=dtype).contiguous()
+            prefix_v = prefix_v.to(device=device, dtype=dtype).contiguous()
+            prompt_cache = PrefixKVCache(prefix_k, prefix_v)
+            if trt_diffusion is not None:
+                logger.info(f"  prefix_k shape: {prefix_k.shape}")
+                if prefix_k.dtype != dtype or prefix_v.dtype != dtype:
+                    raise TypeError(
+                        f"TRT KV dtype mismatch: expected {dtype}, got "
+                        f"prefix_k={prefix_k.dtype}, prefix_v={prefix_v.dtype}"
+                    )
+                compiled_diff_batch = getattr(model, "_trt_diffusion_batch_size", None)
+                if compiled_diff_batch is not None and int(b_star) != int(compiled_diff_batch):
+                    raise ValueError(
+                        f"TRT diffusion batch mismatch: compiled batch={compiled_diff_batch}, runtime batch={b_star}. "
+                        "Recompile TRT diffusion with matching batch (input_batch * num_traj_samples)."
+                    )
+
+            forward_kwargs = {}
+            if model.config.expert_non_causal_attention:
+                forward_kwargs["is_causal"] = False
+
+            if trt_diffusion is not None:
+
+                def step_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+                    return trt_diffusion(
+                        x.to(dtype), t.to(dtype), prefix_k, prefix_v, position_ids, attention_mask
+                    )
+            else:
+
+                def step_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+                    b = x.shape[0]
+                    future_token_embeds = model.action_in_proj(x, t)
+                    if future_token_embeds.dim() == 2:
+                        future_token_embeds = future_token_embeds.view(b, n_diffusion_tokens, -1)
+                    expert_out = model.expert(
+                        inputs_embeds=future_token_embeds,
+                        position_ids=position_ids,
+                        past_key_values=prompt_cache,
+                        attention_mask=attention_mask,
+                        use_cache=True,
+                        **forward_kwargs,
+                    )
+                    prompt_cache.crop(prefill_seq_len)
+                    last_hidden = expert_out.last_hidden_state[:, -n_diffusion_tokens:]
+                    return model.action_out_proj(last_hidden).view(
+                        -1, *model.action_space.get_action_space_dims()
+                    )
+
+            total_batch = B * int(chunk_samples)
+            sampled_action = model.diffusion.sample(
+                batch_size=total_batch,
+                step_fn=step_fn,
+                device=device,
+                return_all_steps=False,
+            )
+
+            hist_xyz_rep = einops.repeat(
+                ego_history_xyz[:, -1], "b ... -> (b n) ...", n=int(chunk_samples)
+            )
+            hist_rot_rep = einops.repeat(
+                ego_history_rot[:, -1], "b ... -> (b n) ...", n=int(chunk_samples)
+            )
+            pred_xyz_chunk, pred_rot_chunk = model.action_space.action_to_traj(
+                sampled_action, hist_xyz_rep, hist_rot_rep
+            )
+            pred_xyz_chunk = einops.rearrange(
+                pred_xyz_chunk, "(b ns nj) ... -> b ns nj ...", ns=1, nj=int(chunk_samples)
+            )
+            pred_rot_chunk = einops.rearrange(
+                pred_rot_chunk, "(b ns nj) ... -> b ns nj ...", ns=1, nj=int(chunk_samples)
+            )
+
+            extra_chunk = extract_text_tokens(model.tokenizer, vlm_outputs.sequences)
+            for k in extra_chunk:
+                extra_chunk[k] = np.array(extra_chunk[k]).reshape([input_ids.shape[0], 1, int(chunk_samples)])
+
+            return pred_xyz_chunk, pred_rot_chunk, extra_chunk
+
+        pred_xyz_chunks: list[torch.Tensor] = []
+        pred_rot_chunks: list[torch.Tensor] = []
+        extra_chunks: list[dict[str, np.ndarray]] = []
+        remaining = int(num_traj_samples)
+
+        try:
+            while remaining > 0:
+                chunk_samples = int(min(remaining, max_samples_per_call))
+                chunk_pred_xyz, chunk_pred_rot, chunk_extra = _run_single_chunk(chunk_samples)
+                pred_xyz_chunks.append(chunk_pred_xyz)
+                pred_rot_chunks.append(chunk_pred_rot)
+                extra_chunks.append(chunk_extra)
+                remaining -= chunk_samples
+        finally:
+            if original_vision_forward is not None:
+                model.vlm.model.visual.forward = original_vision_forward
+
+        if len(pred_xyz_chunks) == 1:
+            pred_xyz = pred_xyz_chunks[0]
+            pred_rot = pred_rot_chunks[0]
+            extra = extra_chunks[0]
         else:
-
-            def step_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-                b = x.shape[0]
-                future_token_embeds = model.action_in_proj(x, t)
-                if future_token_embeds.dim() == 2:
-                    future_token_embeds = future_token_embeds.view(b, n_diffusion_tokens, -1)
-                expert_out = model.expert(
-                    inputs_embeds=future_token_embeds,
-                    position_ids=position_ids,
-                    past_key_values=prompt_cache,
-                    attention_mask=attention_mask,
-                    use_cache=True,
-                    **forward_kwargs,
-                )
-                prompt_cache.crop(prefill_seq_len)
-                last_hidden = expert_out.last_hidden_state[:, -n_diffusion_tokens:]
-                return model.action_out_proj(last_hidden).view(
-                    -1, *model.action_space.get_action_space_dims()
-                )
-
-        total_batch = B * num_traj_samples
-        sampled_action = model.diffusion.sample(
-            batch_size=total_batch,
-            step_fn=step_fn,
-            device=device,
-            return_all_steps=False,
-        )
-
-        hist_xyz_rep = einops.repeat(
-            ego_history_xyz[:, -1], "b ... -> (b n) ...", n=num_traj_samples
-        )
-        hist_rot_rep = einops.repeat(
-            ego_history_rot[:, -1], "b ... -> (b n) ...", n=num_traj_samples
-        )
-        pred_xyz, pred_rot = model.action_space.action_to_traj(
-            sampled_action, hist_xyz_rep, hist_rot_rep
-        )
-        pred_xyz = einops.rearrange(
-            pred_xyz, "(b ns nj) ... -> b ns nj ...", ns=1, nj=num_traj_samples
-        )
-        pred_rot = einops.rearrange(
-            pred_rot, "(b ns nj) ... -> b ns nj ...", ns=1, nj=num_traj_samples
-        )
-
-        extra = extract_text_tokens(model.tokenizer, vlm_outputs.sequences)
-        for k in extra:
-            extra[k] = np.array(extra[k]).reshape([input_ids.shape[0], 1, num_traj_samples])
+            pred_xyz = torch.cat(pred_xyz_chunks, dim=2)
+            pred_rot = torch.cat(pred_rot_chunks, dim=2)
+            extra = {}
+            extra_keys = extra_chunks[0].keys()
+            for key in extra_keys:
+                extra[key] = np.concatenate([chunk[key] for chunk in extra_chunks], axis=2)
 
     inference_time = time.perf_counter() - start_time
     return pred_xyz, pred_rot, extra, inference_time

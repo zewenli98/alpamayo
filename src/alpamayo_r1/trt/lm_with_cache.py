@@ -27,8 +27,10 @@ Tensor shapes:
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from types import MethodType
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -464,17 +466,54 @@ def _export_wrapper(
     orig_use_gqa = _sdpa_mod.use_gqa_in_sdpa
     _sdpa_mod.use_gqa_in_sdpa = lambda *args, **kwargs: False
 
-    batch_dim = torch.export.Dim("batch", min=1, max=max_batch_size)
-    seq_dim = torch.export.Dim("seq_len", min=1, max=max_seq_len)
-    prefix_dim = torch.export.Dim("prefix_len", min=0, max=max_prefix_len)
-    mask_dim = torch.export.Dim("mask_len", min=1, max=max_prefix_len + max_seq_len)
+    def _maybe_dim(name: str, min_value: int, max_value: int):
+        # torch.export.Dim requires max > min; skip static dimensions.
+        if int(max_value) <= int(min_value):
+            return None
+        return torch.export.Dim(name, min=int(min_value), max=int(max_value))
+
+    batch_dim = _maybe_dim("batch", 1, max_batch_size)
+    seq_dim = _maybe_dim("seq_len", 1, max_seq_len)
+    prefix_dim = _maybe_dim("prefix_len", 0, max_prefix_len)
+    mask_dim = _maybe_dim("mask_len", 1, max_prefix_len + max_seq_len)
+
+    attention_mask_shapes: dict[int, Any] = {}
+    if batch_dim is not None:
+        attention_mask_shapes[0] = batch_dim
+    if mask_dim is not None:
+        attention_mask_shapes[1] = mask_dim
+
+    position_ids_shapes: dict[int, Any] = {}
+    if batch_dim is not None:
+        position_ids_shapes[1] = batch_dim
+    if seq_dim is not None:
+        position_ids_shapes[2] = seq_dim
+
+    inputs_embeds_shapes: dict[int, Any] = {}
+    if batch_dim is not None:
+        inputs_embeds_shapes[0] = batch_dim
+    if seq_dim is not None:
+        inputs_embeds_shapes[1] = seq_dim
+
+    pkv_k_shapes: dict[int, Any] = {}
+    if batch_dim is not None:
+        pkv_k_shapes[1] = batch_dim
+    if prefix_dim is not None:
+        pkv_k_shapes[3] = prefix_dim
+
+    pkv_v_shapes: dict[int, Any] = {}
+    if batch_dim is not None:
+        pkv_v_shapes[1] = batch_dim
+    if prefix_dim is not None:
+        pkv_v_shapes[3] = prefix_dim
+
     dynamic_shapes = {
-        "attention_mask": {0: batch_dim, 1: mask_dim},
-        "position_ids": {1: batch_dim, 2: seq_dim},
-        "inputs_embeds": {0: batch_dim, 1: seq_dim},
+        "attention_mask": attention_mask_shapes,
+        "position_ids": position_ids_shapes,
+        "inputs_embeds": inputs_embeds_shapes,
         "past_key_values": (
-            {1: batch_dim, 3: prefix_dim},
-            {1: batch_dim, 3: prefix_dim},
+            pkv_k_shapes,
+            pkv_v_shapes,
         ),
     }
 
@@ -525,8 +564,45 @@ def _export_prefill_wrapper(
     orig_use_gqa = _sdpa_mod.use_gqa_in_sdpa
     _sdpa_mod.use_gqa_in_sdpa = lambda *args, **kwargs: False
 
-    batch_dim = torch.export.Dim("batch", min=1, max=max_batch_size)
-    seq_dim = torch.export.Dim("seq_len", min=1, max=max_seq_len)
+    def _maybe_dim(name: str, min_value: int, max_value: int):
+        # torch.export.Dim requires max > min; skip static dimensions.
+        if int(max_value) <= int(min_value):
+            return None
+        return torch.export.Dim(name, min=int(min_value), max=int(max_value))
+
+    batch_dim = _maybe_dim("batch", 1, max_batch_size)
+    seq_dim = _maybe_dim("seq_len", 1, max_seq_len)
+
+    attention_mask_shapes: dict[int, Any] = {}
+    if batch_dim is not None:
+        attention_mask_shapes[0] = batch_dim
+    if seq_dim is not None:
+        attention_mask_shapes[1] = seq_dim
+
+    position_ids_shapes: dict[int, Any] = {}
+    if batch_dim is not None:
+        position_ids_shapes[1] = batch_dim
+    if seq_dim is not None:
+        position_ids_shapes[2] = seq_dim
+
+    inputs_embeds_shapes: dict[int, Any] = {}
+    if batch_dim is not None:
+        inputs_embeds_shapes[0] = batch_dim
+    if seq_dim is not None:
+        inputs_embeds_shapes[1] = seq_dim
+
+    visual_pos_shapes: dict[int, Any] = {}
+    if batch_dim is not None:
+        visual_pos_shapes[0] = batch_dim
+    if seq_dim is not None:
+        visual_pos_shapes[1] = seq_dim
+
+    deepstack_shapes: dict[int, Any] = {}
+    if batch_dim is not None:
+        deepstack_shapes[1] = batch_dim
+    if seq_dim is not None:
+        deepstack_shapes[2] = seq_dim
+
     dynamic_shapes = {
         "attention_mask": {0: batch_dim, 1: seq_dim},
         "position_ids": {1: batch_dim, 2: seq_dim},
@@ -566,6 +642,93 @@ def _export_prefill_wrapper(
         _sdpa_mod.use_gqa_in_sdpa = orig_use_gqa
 
     return ep
+
+
+def _quantize_lm_decode_wrapper(
+    wrapper: nn.Module,
+    *,
+    hidden_size: int,
+    num_layers: int,
+    num_kv_heads: int,
+    head_dim: int,
+    batch_size: int,
+    max_seq_len: int,
+    max_prefix_len: int,
+    dtype: torch.dtype,
+    device: str,
+    quantization_args: Any,
+) -> nn.Module:
+    """
+    Quantize LM decode wrapper with representative KV-cache calibration inputs.
+    """
+    from alpamayo_r1.trt import quantize_utils
+
+    # Keep calibration lightweight to avoid unnecessary memory pressure.
+    # Weight-only FP8 does not require large calibration batches.
+    calib_bsz = max(1, min(int(batch_size), 2))
+
+    short_seq = 1
+    opt_seq = max(1, min(max_seq_len, 32))
+    long_seq = max(1, min(max_seq_len, 128))
+    seq_lens = []
+    for seq in (short_seq, opt_seq, long_seq):
+        if seq not in seq_lens:
+            seq_lens.append(seq)
+
+    zero_prefix = 0
+    opt_prefix = max(0, min(max_prefix_len, 64))
+    long_prefix = max(0, min(max_prefix_len, 256))
+    prefix_lens = []
+    for prefix in (zero_prefix, opt_prefix, long_prefix):
+        if prefix not in prefix_lens:
+            prefix_lens.append(prefix)
+
+    def _calibration_loop(lm_wrapper: nn.Module) -> None:
+        with torch.no_grad():
+            for seq_len in seq_lens:
+                for prefix_len in prefix_lens:
+                    inputs_embeds = torch.randn(
+                        calib_bsz, seq_len, hidden_size, dtype=dtype, device=device
+                    )
+                    attention_mask = torch.ones(
+                        calib_bsz, prefix_len + seq_len, dtype=torch.long, device=device
+                    )
+                    # Use absolute positions aligned with cache prefix length.
+                    position_ids = (
+                        torch.arange(
+                            prefix_len,
+                            prefix_len + seq_len,
+                            device=device,
+                            dtype=torch.long,
+                        )
+                        .view(1, 1, -1)
+                        .expand(3, calib_bsz, -1)
+                        .clone()
+                    )
+                    prefix_k = torch.zeros(
+                        num_layers,
+                        calib_bsz,
+                        num_kv_heads,
+                        prefix_len,
+                        head_dim,
+                        dtype=dtype,
+                        device=device,
+                    )
+                    prefix_v = torch.zeros_like(prefix_k)
+                    lm_wrapper(
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        inputs_embeds=inputs_embeds,
+                        past_key_values=(prefix_k, prefix_v),
+                    )
+
+    logger.info("Quantizing LM decode wrapper before TRT export...")
+    quantized_wrapper = quantize_utils.quantize_model(
+        wrapper,
+        quantization_args,
+        calibration_forward_loop=_calibration_loop,
+    )
+    return quantized_wrapper.eval()
 
 
 def _fix_requires_output_allocator(trt_backbone: nn.Module) -> None:
@@ -836,6 +999,7 @@ def compile_vlm_lm_trt_with_cache(
     offload_module_to_cpu: bool = False,
     debug: bool = False,
     accuracy_check: bool = False,
+    quantization_args: Any | None = None,
 ) -> nn.Module:
     """
     Compile Qwen3-VL language model with explicit KV-cache tensor I/O.
@@ -887,6 +1051,21 @@ def compile_vlm_lm_trt_with_cache(
         bsz, opt_prefix_len + opt_seq_len, dtype=torch.long, device=device
     )
     example_position_ids = torch.arange(opt_seq_len, device=device).view(1, 1, -1).expand(3, bsz, -1).clone()
+
+    if quantization_args is not None:
+        wrapper = _quantize_lm_decode_wrapper(
+            wrapper,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            batch_size=bsz,
+            max_seq_len=max_seq_len,
+            max_prefix_len=max_prefix_len,
+            dtype=dtype,
+            device=device,
+            quantization_args=quantization_args,
+        )
 
     ep = _export_wrapper(
         wrapper=wrapper,
