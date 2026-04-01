@@ -59,9 +59,16 @@ class PrefixKVCache:
 
     __prefix_kv_cache__ = True
 
-    def __init__(self, prefix_k: torch.Tensor, prefix_v: torch.Tensor):
+    def __init__(
+        self,
+        prefix_k: torch.Tensor,
+        prefix_v: torch.Tensor,
+        *,
+        treat_prefix_as_empty: bool = False,
+    ):
         self._k = prefix_k
         self._v = prefix_v
+        self._treat_prefix_as_empty = bool(treat_prefix_as_empty)
         self._next_k: torch.Tensor | None = None
         self._next_v: torch.Tensor | None = None
         self._updated_k: list[torch.Tensor | None] = [None] * prefix_k.shape[0]
@@ -89,7 +96,11 @@ class PrefixKVCache:
             dtype=dtype,
             device=device,
         )
-        return cls(empty_k, torch.zeros_like(empty_k))
+        return cls(
+            empty_k,
+            torch.zeros_like(empty_k),
+            treat_prefix_as_empty=True,
+        )
 
     @property
     def key_cache(self) -> torch.Tensor:
@@ -115,8 +126,14 @@ class PrefixKVCache:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         del cache_kwargs
         if _is_graph_capture_active():
-            k = torch.cat([self._k[layer_idx], key_states], dim=-2)
-            v = torch.cat([self._v[layer_idx], value_states], dim=-2)
+            if self._treat_prefix_as_empty:
+                # Avoid concat-with-empty during export/compile. Some TRT versions
+                # fail when the empty operand is lowered as a constant tensor.
+                k = key_states
+                v = value_states
+            else:
+                k = torch.cat([self._k[layer_idx], key_states], dim=-2)
+                v = torch.cat([self._v[layer_idx], value_states], dim=-2)
             self._updated_k[layer_idx] = k
             self._updated_v[layer_idx] = v
             return k, v
@@ -171,6 +188,7 @@ class PrefixKVCache:
     def update_stacked(self, key_cache: torch.Tensor, value_cache: torch.Tensor) -> None:
         self._k = key_cache
         self._v = value_cache
+        self._treat_prefix_as_empty = False
         self._next_k = None
         self._next_v = None
         self._updated_k = [None] * key_cache.shape[0]

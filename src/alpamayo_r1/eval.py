@@ -18,6 +18,57 @@ from alpamayo_r1 import helper
 from alpamayo_r1.test_trt_torch import prepare_model_inputs
 from alpamayo_r1.trt.compile_trt import compile_trt_modules, run_inference_trt
 
+
+def make_joint_calibration_forward_loop(
+    *,
+    clip_ids: list[str],
+    processor,
+    t0_us: int,
+    top_p: float,
+    temperature: float,
+    max_generation_length: int,
+    calibration_traj_samples: int,
+    device: str,
+):
+    """
+    Build a calibration loop that exercises both VLM generation and diffusion.
+
+    This avoids text-only calibration and ensures quantizers in the rollout path
+    (vlm/expert/diffusion-related modules) observe representative activations.
+    """
+    def _calibration_loop(runtime_model):
+        runtime_model.eval()
+        with torch.no_grad():
+            for clip_id in clip_ids:
+                data = load_physical_aiavdataset(clip_id, t0_us=t0_us)
+                messages = helper.create_message(data["image_frames"].flatten(0, 1))
+                inputs = processor.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    add_generation_prompt=False,
+                    continue_final_message=True,
+                    return_dict=True,
+                    return_tensors="pt",
+                )
+                model_inputs = {
+                    "tokenized_data": inputs,
+                    "ego_history_xyz": data["ego_history_xyz"],
+                    "ego_history_rot": data["ego_history_rot"],
+                }
+                model_inputs = helper.to_device(model_inputs, device)
+
+                with torch.autocast("cuda", dtype=torch.float16):
+                    runtime_model.sample_trajectories_from_data_with_vlm_rollout(
+                        data=model_inputs,
+                        top_p=top_p,
+                        temperature=temperature,
+                        num_traj_samples=calibration_traj_samples,
+                        max_generation_length=max_generation_length,
+                    )
+
+    return _calibration_loop
+
+
 def read_clip_ids_from_parquet(parquet_path: str) -> list[str]:
     """
     Reads clip_ids from parquet. Tries common column names; falls back to index if needed.
@@ -184,6 +235,11 @@ def main():
         default=0,
         help="Override max_prefix_len for TRT compile (0 = use observed prefix_seq_len).",
     )
+    ap.add_argument(
+        "--quantize_fp8",
+        action="store_true",
+        help="Quantize the entire pytorch model to fp8 before running evaluation.",
+    )
     args = ap.parse_args()
 
     script_dir = Path(__file__).resolve().parent
@@ -200,6 +256,34 @@ def main():
         device=device, dtype=torch.float16
     )
     model.eval()
+
+    if args.quantize_fp8:
+        # IMPORTANT: build processor once (do NOT rebuild per clip)
+        processor = helper.get_processor(model.tokenizer)
+        from alpamayo_r1.trt.quantize_utils import quantize_model
+        quantization_args = argparse.Namespace(
+            quant_format="fp8",
+            quant_algo="max",
+            weight_only=False,
+            debug=True,
+        )
+        calibration_forward_loop = make_joint_calibration_forward_loop(
+            clip_ids=clip_ids,
+            processor=processor,
+            t0_us=args.t0_us,
+            top_p=args.top_p,
+            temperature=args.temperature,
+            max_generation_length=args.max_generation_length,
+            calibration_traj_samples=args.num_traj_samples,
+            device=device,
+        )
+        model = quantize_model(
+            model,
+            quantization_args,
+            calibration_forward_loop=calibration_forward_loop,
+        )
+        model.eval()
+
     seed = None if args.seed < 0 else args.seed
 
     trt_vision = None
@@ -237,8 +321,8 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # IMPORTANT: build processor once (do NOT rebuild per clip)
-    processor = helper.get_processor(model.tokenizer)
+    if not args.quantize_fp8:
+        processor = helper.get_processor(model.tokenizer)
 
     # Optional: tqdm progress if available
     try:

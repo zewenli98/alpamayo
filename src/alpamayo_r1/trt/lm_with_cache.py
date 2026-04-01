@@ -475,7 +475,11 @@ def _export_wrapper(
     batch_dim = _maybe_dim("batch", 1, max_batch_size)
     seq_dim = _maybe_dim("seq_len", 1, max_seq_len)
     prefix_dim = _maybe_dim("prefix_len", 0, max_prefix_len)
-    mask_dim = _maybe_dim("mask_len", 1, max_prefix_len + max_seq_len)
+    # torch.export derives a tighter lower guard for attention_mask length
+    # in this decode wrapper. Match that lower bound here to avoid
+    # non-strict export constraint violations in fallback tracing.
+    mask_min_len = 4 if (max_prefix_len + max_seq_len) >= 4 else 1
+    mask_dim = _maybe_dim("mask_len", mask_min_len, max_prefix_len + max_seq_len)
 
     attention_mask_shapes: dict[int, Any] = {}
     if batch_dim is not None:

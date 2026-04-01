@@ -63,9 +63,10 @@ def compile_vision_trt(
     quantization_args = argparse.Namespace(
         quant_format="fp8",
         quant_algo="max",
-        weight_only=True,
+        weight_only=False,
         debug=True,
     )
+    # quantization_args = None
 
     trt_vision = compile_vision_model(
         model.vlm.model.visual,
@@ -98,9 +99,10 @@ def compile_diffusion_no_cache_trt(
     quantization_args = argparse.Namespace(
         quant_format="fp8",
         quant_algo="max",
-        weight_only=True,
+        weight_only=False,
         debug=True,
     )
+    # quantization_args = None
 
     compile_diffusion_step_no_cache(
         model,
@@ -137,9 +139,10 @@ def compile_language_trt(
     quantization_args = argparse.Namespace(
         quant_format="fp8",
         quant_algo="max",
-        weight_only=True,
+        weight_only=False,
         debug=True,
     )
+    # quantization_args = None
 
     compiled_model = compile_vlm_lm_trt_with_cache(
         model,
@@ -243,7 +246,7 @@ def compile_trt_modules(
         offload_module_to_cpu=offload_module_to_cpu,
     )
     if trt_vision is None:
-        logger.error("Failed to compile vision model")
+        raise RuntimeError("Failed to compile vision model")
     ####################################################
 
     lm_seq_len = (
@@ -267,7 +270,7 @@ def compile_trt_modules(
         offload_module_to_cpu=offload_module_to_cpu,
     )
     if trt_lm is None:
-        logger.error("Failed to compile language model")
+        raise RuntimeError("Failed to compile language model")
     ####################################################
 
 
@@ -282,7 +285,7 @@ def compile_trt_modules(
         offload_module_to_cpu=offload_module_to_cpu,
     )
     if trt_diffusion is None:
-        logger.error("Failed to compile no-cache diffusion step")
+        raise RuntimeError("Failed to compile no-cache diffusion step")
     else:
         model._trt_diffusion_batch_size = int(compile_batch)
     ####################################################
