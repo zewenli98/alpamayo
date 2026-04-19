@@ -59,14 +59,13 @@ def compile_vision_trt(
 
     from alpamayo_r1.trt.vision import compile_vision_model
     import argparse
-
-    quantization_args = argparse.Namespace(
-        quant_format="fp8",
-        quant_algo="max",
-        weight_only=False,
-        debug=True,
-    )
-    # quantization_args = None
+    # quantization_args = argparse.Namespace(
+    #     quant_format="fp8",
+    #     quant_algo="max",
+    #     weight_only=False,
+    #     debug=True,
+    # )
+    quantization_args = None
 
     trt_vision = compile_vision_model(
         model.vlm.model.visual,
@@ -96,13 +95,13 @@ def compile_diffusion_no_cache_trt(
 
     from alpamayo_r1.trt.diffusion import compile_diffusion_step_no_cache
     import argparse
-    quantization_args = argparse.Namespace(
-        quant_format="fp8",
-        quant_algo="max",
-        weight_only=False,
-        debug=True,
-    )
-    # quantization_args = None
+    # quantization_args = argparse.Namespace(
+    #     quant_format="fp8",
+    #     quant_algo="max",
+    #     weight_only=False,
+    #     debug=True,
+    # )
+    quantization_args = None
 
     compile_diffusion_step_no_cache(
         model,
@@ -136,13 +135,13 @@ def compile_language_trt(
     from alpamayo_r1.trt.lm_with_cache import compile_vlm_lm_trt_with_cache
     import argparse
 
-    quantization_args = argparse.Namespace(
-        quant_format="fp8",
-        quant_algo="max",
-        weight_only=False,
-        debug=True,
-    )
-    # quantization_args = None
+    # quantization_args = argparse.Namespace(
+    #     quant_format="fp8",
+    #     quant_algo="max",
+    #     weight_only=False,
+    #     debug=True,
+    # )
+    quantization_args = None
 
     compiled_model = compile_vlm_lm_trt_with_cache(
         model,

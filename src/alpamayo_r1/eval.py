@@ -236,10 +236,20 @@ def main():
         help="Override max_prefix_len for TRT compile (0 = use observed prefix_seq_len).",
     )
     ap.add_argument(
-        "--quantize_fp8",
-        action="store_true",
-        help="Quantize the entire pytorch model to fp8 before running evaluation.",
+        "--quant_format",
+        type=str,
+        default=None,
+        choices=["fp8"],
+        help="Jointly quantize the entire pytorch model to the specified format before running evaluation.",
     )
+    ap.add_argument("--quant_algo", type=str, default="max", choices=["max", "smoothquant"])
+    ap.add_argument(
+        "--quant_weight_only",
+        action="store_true",
+        help="Jointly quantize the entire pytorch model to weight-only before running evaluation.",
+    )
+    ap.add_argument("--calib_parquet", type=str, default="0417_5k_train_set_for_calibration_25.10.parquet")
+    ap.add_argument("--num_of_calib_clips", type=int, default=1000)
     args = ap.parse_args()
 
     script_dir = Path(__file__).resolve().parent
@@ -257,18 +267,24 @@ def main():
     )
     model.eval()
 
-    if args.quantize_fp8:
+    if args.quant_format is not None:
+        assert args.calib_parquet is not None, "--calib_parquet is required when quant_format is not None"
+        assert 0 < args.num_of_calib_clips <= 5000, "--num_of_calib_clips must be between 1 and 5000"
+        calib_parquet_path = (script_dir / args.calib_parquet).resolve()
+        calib_clip_ids = read_clip_ids_from_parquet(str(calib_parquet_path))
+        calib_clip_ids = calib_clip_ids[: args.num_of_calib_clips]
+        print(f"Loaded {len(calib_clip_ids)} calibration clip_ids from: {calib_parquet_path}")
         # IMPORTANT: build processor once (do NOT rebuild per clip)
         processor = helper.get_processor(model.tokenizer)
         from alpamayo_r1.trt.quantize_utils import quantize_model
         quantization_args = argparse.Namespace(
-            quant_format="fp8",
-            quant_algo="max",
-            weight_only=False,
+            quant_format=args.quant_format,
+            quant_algo=args.quant_algo,
+            weight_only=args.quant_weight_only,
             debug=True,
         )
         calibration_forward_loop = make_joint_calibration_forward_loop(
-            clip_ids=clip_ids,
+            clip_ids=calib_clip_ids,
             processor=processor,
             t0_us=args.t0_us,
             top_p=args.top_p,
@@ -321,7 +337,7 @@ def main():
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    if not args.quantize_fp8:
+    if args.quant_format is None:
         processor = helper.get_processor(model.tokenizer)
 
     # Optional: tqdm progress if available
