@@ -115,6 +115,14 @@ def quantize_model(model, args, tokenizer=None, calibration_forward_loop=None):
             quant_cfg = mtq.FP8_DEFAULT_CFG
     elif args.quant_format == "nvfp4":
         quant_cfg = mtq.NVFP4_DEFAULT_CFG
+        quant_cfg["quant_cfg"]["*action_in_proj.encoder.trunk.0.input_quantizer"] = {
+            "enable": False
+        }
+        quant_cfg["quant_cfg"]["*action_in_proj.encoder.trunk.0.weight_quantizer"] = {
+            "enable": False
+        }
+    elif args.quant_format == "w4a8_nvfp4_fp8":
+        quant_cfg = mtq.W4A8_NVFP4_FP8_CFG
     else:
         raise RuntimeError("Unsupported quantization format")
 
@@ -130,4 +138,3 @@ def quantize_model(model, args, tokenizer=None, calibration_forward_loop=None):
         mtq.fold_weight(model)
 
     return model
-

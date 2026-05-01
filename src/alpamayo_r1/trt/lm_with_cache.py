@@ -753,6 +753,92 @@ def _fix_requires_output_allocator(trt_backbone: nn.Module) -> None:
     logger.info("Enabled output allocator on %d TRT submodule(s)", fixed)
 
 
+def _patch_qwen3vl_text_attention_for_static_hidden_reshape(language_model: nn.Module) -> None:
+    """
+    Patch Qwen3VLTextAttention.forward so attention output reshape uses a static
+    hidden dimension (`o_proj.in_features`) instead of `-1`.
+
+    This keeps TRT tensor metadata for the last dim concrete on common
+    `reshape([B, seq, -1])` attention-output paths.
+    """
+    try:
+        import importlib
+
+        qwen3_vl_modeling = importlib.import_module(
+            "transformers.models.qwen3_vl.modeling_qwen3_vl"
+        )
+        ALL_ATTENTION_FUNCTIONS = qwen3_vl_modeling.ALL_ATTENTION_FUNCTIONS
+        apply_rotary_pos_emb = qwen3_vl_modeling.apply_rotary_pos_emb
+        eager_attention_forward = qwen3_vl_modeling.eager_attention_forward
+    except Exception:
+        logger.warning(
+            "Could not import Qwen3-VL text attention symbols; skipping static reshape patch"
+        )
+        return
+
+    patched_layers = 0
+    for layer in language_model.layers:
+        self_attn = getattr(layer, "self_attn", None)
+        if self_attn is None or getattr(self_attn, "_trt_static_hidden_reshape_patched", False):
+            continue
+
+        def _patched_forward(
+            self,
+            hidden_states,
+            position_embeddings,
+            attention_mask,
+            past_key_values=None,
+            cache_position=None,
+            **kwargs,
+        ):
+            input_shape = hidden_states.shape[:-1]
+            hidden_shape = (*input_shape, -1, self.head_dim)
+
+            query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+            key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+            value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+            cos, sin = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin
+            )
+
+            if past_key_values is not None:
+                cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+                key_states, value_states = past_key_values.update(
+                    key_states, value_states, self.layer_idx, cache_kwargs
+                )
+
+            attention_interface = eager_attention_forward
+            if self.config._attn_implementation != "eager":
+                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                **kwargs,
+            )
+
+            attn_output = attn_output.reshape(*input_shape, self.o_proj.in_features).contiguous()
+            attn_output = self.o_proj(attn_output)
+            return attn_output, attn_weights
+
+        self_attn.forward = MethodType(_patched_forward, self_attn)
+        self_attn._trt_static_hidden_reshape_patched = True
+        patched_layers += 1
+
+    if patched_layers > 0:
+        logger.info(
+            "Patched Qwen3-VL text attention reshape for static hidden dim on %d layer(s)",
+            patched_layers,
+        )
+
+
 def _install_hf_generate_wrapper_adapter(
     model: nn.Module,
     wrapper: nn.Module,
@@ -1037,6 +1123,7 @@ def compile_vlm_lm_trt_with_cache(
             layer.self_attn._attn_implementation = "sdpa"
         if hasattr(layer.self_attn, "config"):
             layer.self_attn.config._attn_implementation = "sdpa"
+    _patch_qwen3vl_text_attention_for_static_hidden_reshape(language_model)
 
     wrapper = Qwen3VLTextModelWithCacheWrapper(language_model).to(device=device, dtype=dtype).eval()
 

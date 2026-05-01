@@ -8,6 +8,7 @@ import argparse
 import time
 import pandas as pd
 from pathlib import Path
+from tqdm import tqdm
 
 import torch
 import numpy as np
@@ -39,7 +40,7 @@ def make_joint_calibration_forward_loop(
     def _calibration_loop(runtime_model):
         runtime_model.eval()
         with torch.no_grad():
-            for clip_id in clip_ids:
+            for clip_id in tqdm(clip_ids, desc="calibration"):
                 data = load_physical_aiavdataset(clip_id, t0_us=t0_us)
                 messages = helper.create_message(data["image_frames"].flatten(0, 1))
                 inputs = processor.apply_chat_template(
@@ -198,7 +199,7 @@ def main():
     ap.add_argument("--max_generation_length", type=int, default=256)
     ap.add_argument("--top_p", type=float, default=0.98)
     ap.add_argument("--temperature", type=float, default=0.6)
-    ap.add_argument("--limit", type=int, default=644, help="How many unique clip_ids to evaluate.")
+    ap.add_argument("--limit", type=int, default=-1, help="How many unique clip_ids to evaluate. -1 means all.")
     ap.add_argument("--seed", type=int, default=42, help="Set -1 to disable reseeding per clip.")
     ap.add_argument("--print_every", type=int, default=25)
     ap.add_argument(
@@ -239,7 +240,7 @@ def main():
         "--quant_format",
         type=str,
         default=None,
-        choices=["fp8"],
+        choices=["fp8", "nvfp4", "w4a8_nvfp4_fp8"],
         help="Jointly quantize the entire pytorch model to the specified format before running evaluation.",
     )
     ap.add_argument("--quant_algo", type=str, default="max", choices=["max", "smoothquant"])
@@ -249,7 +250,7 @@ def main():
         help="Jointly quantize the entire pytorch model to weight-only before running evaluation.",
     )
     ap.add_argument("--calib_parquet", type=str, default="0417_5k_train_set_for_calibration_25.10.parquet")
-    ap.add_argument("--num_of_calib_clips", type=int, default=1000)
+    ap.add_argument("--num_of_calib_clips", type=int, default=100)
     args = ap.parse_args()
 
     script_dir = Path(__file__).resolve().parent
