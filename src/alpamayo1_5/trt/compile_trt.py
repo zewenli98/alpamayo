@@ -49,6 +49,8 @@ def compile_vision_trt(
     if trt_vision is None:
         logger.error("Vision TRT compilation failed")
         return None
+
+    logger.info("✓ Vision encoder compiled with TRT")
     return trt_vision
 
 
@@ -72,6 +74,8 @@ def compile_diffusion_no_cache_trt(
     if not hasattr(model, "_trt_diffusion_step_no_cache"):
         logger.error("No-cache diffusion TRT compilation failed")
         return None
+    
+    logger.info("✓ No-cache diffusion step compiled with TRT")
     return model._trt_diffusion_step_no_cache
 
 
@@ -84,6 +88,7 @@ def compile_language_trt(
 ) -> nn.Module | None:
     from alpamayo1_5.trt.lm_with_cache import compile_vlm_lm_trt_with_cache
 
+    compiled_model = None
     compiled_model = compile_vlm_lm_trt_with_cache(
         model,
         max_seq_len=max_seq_len,
@@ -94,9 +99,14 @@ def compile_language_trt(
         debug=False,
         accuracy_check=True,
     )
+    if compiled_model is None:
+        logger.error("Language model TRT compilation failed")
+        return None
+
     model._trt_vlm_backbone = compiled_model
     model._trt_lm_max_batch_size = int(batch_size)
     model._trt_lm_batch_size = int(batch_size)
+    logger.info("✓ Language model compiled with TRT")
     return model._trt_vlm_backbone
 
 

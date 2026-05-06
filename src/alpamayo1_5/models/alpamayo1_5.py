@@ -690,6 +690,127 @@ class Alpamayo1_5(ReasoningVLA):
             return pred_xyz, pred_rot, extra
         return pred_xyz, pred_rot
 
+    def teacher_forced_flow_loss_forward(
+        self,
+        data: dict[str, Any],
+    ) -> dict[str, torch.Tensor]:
+        """Differentiable forward that returns the flow-matching training targets.
+
+        Bypasses autoregressive reasoning generation and diffusion sampling.
+        The VLM runs in a single non-sampling forward pass (with ``<traj_future_start>``
+        appended to the prompt) to build the prompt KV cache; the expert then runs once
+        on a linearly-interpolated noisy action and returns the predicted velocity field.
+
+        Args:
+            data: dict with ``tokenized_data`` (input_ids + other processor outputs),
+                ``ego_history_xyz``, ``ego_history_rot``, ``ego_future_xyz``,
+                ``ego_future_rot``.
+
+        Returns:
+            dict with keys ``v_pred`` and ``v_target``, both shape
+            ``(B, n_diffusion_tokens, action_dim)``. Callers compute MSE between them.
+        """
+        ego_history_xyz = data["ego_history_xyz"]
+        ego_history_rot = data["ego_history_rot"]
+        ego_future_xyz = data["ego_future_xyz"]
+        ego_future_rot = data["ego_future_rot"]
+        B, n_traj_group, _, _ = ego_history_xyz.shape
+        assert n_traj_group == 1, "Only one trajectory group is supported."
+
+        tokenized_data = dict(data["tokenized_data"])
+        input_ids = tokenized_data.pop("input_ids")
+        traj_data_vlm = {
+            "ego_history_xyz": ego_history_xyz,
+            "ego_history_rot": ego_history_rot,
+        }
+        input_ids = self.fuse_traj_tokens(input_ids, traj_data_vlm)
+        device = input_ids.device
+
+        # Append <traj_future_start> so the expert attends through the full prompt
+        # that inference would have generated up to the action block.
+        traj_future_start_id = self.tokenizer.convert_tokens_to_ids(
+            to_special_token("traj_future_start")
+        )
+        start_col = torch.full(
+            (input_ids.shape[0], 1),
+            traj_future_start_id,
+            dtype=input_ids.dtype,
+            device=device,
+        )
+        input_ids = torch.cat([input_ids, start_col], dim=1)
+        if "attention_mask" in tokenized_data and tokenized_data["attention_mask"] is not None:
+            am = tokenized_data["attention_mask"]
+            tokenized_data["attention_mask"] = torch.cat(
+                [am, torch.ones((am.shape[0], 1), dtype=am.dtype, device=am.device)], dim=1
+            )
+
+        vlm_outputs = self.vlm(
+            input_ids=input_ids,
+            use_cache=True,
+            return_dict=True,
+            **tokenized_data,
+        )
+        prompt_cache = vlm_outputs.past_key_values
+        prefill_seq_len = prompt_cache.get_seq_length()
+        rope_deltas = self.vlm.model.rope_deltas
+
+        n_diffusion_tokens = self.action_space.get_action_space_dims()[0]
+        offset = torch.full((B,), prefill_seq_len, device=device, dtype=torch.long)
+
+        position_ids = torch.arange(n_diffusion_tokens, device=device)
+        position_ids = einops.repeat(position_ids, "l -> 3 b l", b=B).clone()
+        delta = rope_deltas + offset[:, None]
+        position_ids += delta.to(position_ids.device)
+
+        # No padding between prompt cache and action block: full attention mask.
+        attention_mask = torch.zeros(
+            (B, 1, n_diffusion_tokens, prefill_seq_len + n_diffusion_tokens),
+            dtype=torch.float32,
+            device=device,
+        )
+
+        forward_kwargs = {}
+        if self.config.expert_non_causal_attention:
+            forward_kwargs["is_causal"] = False
+
+        # Build flow-matching target: x_1 = GT action, x_0 ~ N(0, I).
+        x_1 = self.action_space.traj_to_action(
+            traj_history_xyz=ego_history_xyz[:, 0],
+            traj_history_rot=ego_history_rot[:, 0],
+            traj_future_xyz=ego_future_xyz[:, 0],
+            traj_future_rot=ego_future_rot[:, 0],
+        )  # (B, n_diffusion_tokens, 2)
+        x_1 = x_1.to(device=device, dtype=torch.float32)
+
+        x_0 = torch.randn_like(x_1)
+        t = torch.rand(B, 1, 1, device=device, dtype=x_1.dtype)
+        x_t = (1.0 - t) * x_0 + t * x_1
+        v_target = x_1 - x_0
+
+        # Cast to action-module dtype to match action_in_proj / expert weights.
+        proj_dtype = next(self.action_in_proj.parameters()).dtype
+        x_t_cast = x_t.to(dtype=proj_dtype)
+        t_cast = t.to(dtype=proj_dtype)
+
+        future_token_embeds = self.action_in_proj(x_t_cast, t_cast)
+        if future_token_embeds.dim() == 2:
+            future_token_embeds = future_token_embeds.view(B, n_diffusion_tokens, -1)
+
+        expert_out = self.expert(
+            inputs_embeds=future_token_embeds,
+            position_ids=position_ids,
+            past_key_values=prompt_cache,
+            attention_mask=attention_mask,
+            use_cache=True,
+            **forward_kwargs,
+        )
+        prompt_cache.crop(prefill_seq_len)
+        last_hidden = expert_out.last_hidden_state[:, -n_diffusion_tokens:]
+        v_pred = self.action_out_proj(last_hidden).view(
+            B, *self.action_space.get_action_space_dims()
+        )
+
+        return {"v_pred": v_pred.to(torch.float32), "v_target": v_target}
 
 AutoConfig.register("alpamayo1_5", Alpamayo1_5Config)
 AutoModel.register(Alpamayo1_5Config, Alpamayo1_5)
