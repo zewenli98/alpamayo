@@ -9,9 +9,11 @@ import time
 import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
+import os
 
 import torch
 import numpy as np
+import modelopt.torch.opt as mto
 
 from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5
 from alpamayo1_5.load_physical_aiavdataset import load_physical_aiavdataset
@@ -251,6 +253,7 @@ def main():
     )
     ap.add_argument("--calib_parquet", type=str, default="0417_5k_train_set_for_calibration_25.10.parquet")
     ap.add_argument("--num_of_calib_clips", type=int, default=100)
+    ap.add_argument("--save_model_dir", type=str, default=None, help="Directory to save the quantized model.")
     args = ap.parse_args()
 
     script_dir = Path(__file__).resolve().parent
@@ -263,20 +266,31 @@ def main():
     print(f"Loaded {len(clip_ids)} clip_ids from: {parquet_path}")
 
     device = "cuda"
-    model = Alpamayo1_5.from_pretrained(args.ckpt, dtype=torch.float16).to(
-        device=device, dtype=torch.float16
-    )
+    # Enable automatic ModelOpt save/restore with huggingface checkpointing APIs
+    # This needs to be done only once in the program
+    mto.enable_huggingface_checkpointing()
+    customized_model = False
+    if args.ckpt == "nvidia/Alpamayo-1.5-10B":
+        model = Alpamayo1_5.from_pretrained(args.ckpt, dtype=torch.float16).to(
+            device=device, dtype=torch.float16
+        )
+    else:
+        customized_model = True
+        model = Alpamayo1_5.from_pretrained(args.ckpt).to(device=device)
+        import modelopt.torch.quantization as mtq
+        mtq.print_quant_summary(model)
     model.eval()
 
-    if args.quant_format is not None:
+    # IMPORTANT: build processor once (do NOT rebuild per clip)
+    processor = helper.get_processor(model.tokenizer)
+
+    if args.quant_format is not None and not customized_model:
         assert args.calib_parquet is not None, "--calib_parquet is required when quant_format is not None"
         assert 0 < args.num_of_calib_clips <= 5000, "--num_of_calib_clips must be between 1 and 5000"
         calib_parquet_path = (script_dir / args.calib_parquet).resolve()
         calib_clip_ids = read_clip_ids_from_parquet(str(calib_parquet_path))
         calib_clip_ids = calib_clip_ids[: args.num_of_calib_clips]
         print(f"Loaded {len(calib_clip_ids)} calibration clip_ids from: {calib_parquet_path}")
-        # IMPORTANT: build processor once (do NOT rebuild per clip)
-        processor = helper.get_processor(model.tokenizer)
 
         from alpamayo1_5.trt.quantize_utils import quantize_model, auto_quantize_model
 
@@ -321,6 +335,13 @@ def main():
             )
         model.eval()
 
+    if args.save_model_dir is not None:
+        save_dir = os.path.join(args.save_model_dir, f"alpamayo1.5{'_' + str(args.quant_format) if args.quant_format is not None else '_fp16'}{'_' + str(args.auto_quantize_bits) + 'bits' if args.quant_format == 'auto' else ''}{'_weight_only' if args.quant_weight_only else ''}{'_calib' + str(args.num_of_calib_clips) if args.quant_format is not None else ''}")
+        os.makedirs(save_dir, exist_ok=True)
+        print(f"Saving quantized model to: {save_dir}")
+        model.save_pretrained(save_dir)
+        print(f"Quantized model saved to: {save_dir}")
+
     seed = None if args.seed < 0 else args.seed
 
     trt_vision = None
@@ -357,10 +378,6 @@ def main():
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
-    if args.quant_format is None:
-        # IMPORTANT: build processor once (do NOT rebuild per clip)
-        processor = helper.get_processor(model.tokenizer)
 
     it = tqdm(clip_ids, desc="Evaluating clips")
 
