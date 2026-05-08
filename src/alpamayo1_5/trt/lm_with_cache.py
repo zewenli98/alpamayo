@@ -33,22 +33,14 @@ class Qwen3VLTextModelWithCacheWrapper(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
+        # NOTE: a single, branch-free implementation is intentional here.
+        # An earlier `if q_len == 1: ...` shortcut was a data-dependent
+        # Python branch that torch.export would erase based on the example
+        # shape (q_len=128), leaving the decode-time code path untraced.
+        # `triu(ones(1,1), diagonal=1)` is correctly empty, so this branch
+        # also produces the right mask for q_len == 1.
         neg_inf = torch.finfo(torch.float32).min
         kv_len = prefix_len + q_len
-        if q_len == 1:
-            causal_mask = torch.zeros(batch_size, 1, 1, kv_len, device=device, dtype=torch.float32)
-            if attention_mask is not None:
-                if attention_mask.ndim == 4:
-                    keep = attention_mask[:, :, -1:, :].to(torch.bool)
-                else:
-                    keep = attention_mask[:, None, None, :].to(torch.bool)
-                causal_mask = torch.where(
-                    keep,
-                    causal_mask,
-                    torch.full((), neg_inf, dtype=torch.float32, device=device),
-                )
-            return causal_mask.to(dtype=dtype)
-
         future = torch.triu(torch.ones(q_len, q_len, device=device, dtype=torch.bool), diagonal=1)
         causal_q = torch.zeros(q_len, q_len, device=device, dtype=torch.float32).masked_fill(future, neg_inf)
         base = torch.cat(
@@ -378,7 +370,16 @@ def _export_wrapper(
     batch_dim = torch.export.Dim("batch", min=1, max=max_batch_size)
     seq_dim = torch.export.Dim("seq_len", min=1, max=max_seq_len)
     prefix_dim = torch.export.Dim("prefix_len", min=0, max=max_prefix_len)
-    mask_dim = torch.export.Dim("mask_len", min=4, max=max_prefix_len + max_seq_len)
+    # The wrapper guarantees `attention_mask.shape[1] == prefix_len + q_len`
+    # at runtime (see _wrapper_forward).  Declaring `mask_len` as an
+    # independent named Dim lets torch.export invent a fresh symbol that
+    # TRT could later mis-bind to other input dims (e.g. batch), producing
+    # bogus reshape targets like `[mask_len, 1, -1]` on the Q tensor.
+    # `Dim + Dim` is not supported by this torch version, so we use
+    # `Dim.AUTO` and let the exporter derive `mask_len = prefix_len + seq_len`
+    # from the actual trace (the `_build_causal_mask` masked_fill broadcast
+    # makes that relation observable to the symbolic shape engine).
+    mask_dim = torch.export.Dim.AUTO
     dynamic_shapes = {
         "attention_mask": {0: batch_dim, 1: mask_dim},
         "position_ids": {1: batch_dim, 2: seq_dim},
@@ -724,6 +725,7 @@ def compile_vlm_lm_trt_with_cache(
         "debug": debug,
         "allow_complex_guards_as_runtime_asserts": True,
         "offload_module_to_cpu": False,
+        "decompose_attention": True,
     }
     trt_inputs = [example_attention_mask, example_position_ids, example_embeds, example_past_key_values]
     with torch_tensorrt.dynamo.Debugger() if debug else nullcontext():

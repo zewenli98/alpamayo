@@ -103,32 +103,50 @@ def _make_sample_inputs(
     num_layers = cfg["num_layers"]
     num_kv_heads = cfg["num_kv_heads"]
     head_dim = cfg["head_dim"]
-    bsz = int(batch_size)
-    if bsz <= 0:
+    max_bsz = int(batch_size)
+    if max_bsz <= 0:
         raise ValueError(f"batch_size must be > 0, got {batch_size}")
     opt_prefix_len = (min_prefix_len + max_prefix_len) // 2
 
-    def make_inputs(prefix_len: int) -> list[torch.Tensor]:
+    def make_inputs(prefix_len: int, bsz: int | None = None) -> list[torch.Tensor]:
+        b = max_bsz if bsz is None else int(bsz)
         return [
-            torch.randn(bsz, *action_space_dims, dtype=dtype, device=device),
-            torch.zeros(bsz, 1, 1, dtype=dtype, device=device),
-            torch.zeros(num_layers, bsz, num_kv_heads, prefix_len, head_dim, dtype=dtype, device=device),
-            torch.zeros(num_layers, bsz, num_kv_heads, prefix_len, head_dim, dtype=dtype, device=device),
-            torch.arange(n_diffusion_tokens, device=device).unsqueeze(0).unsqueeze(0).expand(3, bsz, -1).clone(),
-            torch.zeros(bsz, 1, n_diffusion_tokens, prefix_len + n_diffusion_tokens, dtype=dtype, device=device),
+            torch.randn(b, *action_space_dims, dtype=dtype, device=device),
+            torch.zeros(b, 1, 1, dtype=dtype, device=device),
+            torch.zeros(num_layers, b, num_kv_heads, prefix_len, head_dim, dtype=dtype, device=device),
+            torch.zeros(num_layers, b, num_kv_heads, prefix_len, head_dim, dtype=dtype, device=device),
+            torch.arange(n_diffusion_tokens, device=device).unsqueeze(0).unsqueeze(0).expand(3, b, -1).clone(),
+            torch.zeros(b, 1, n_diffusion_tokens, prefix_len + n_diffusion_tokens, dtype=dtype, device=device),
         ]
 
     sample_inputs = tuple(make_inputs(opt_prefix_len))
     prefix_dim = torch.export.Dim("prefix_len", min=min_prefix_len, max=max_prefix_len)
     mask_dim = prefix_dim + n_diffusion_tokens
-    dynamic_shapes = (
-        None,
-        None,
-        {3: prefix_dim},
-        {3: prefix_dim},
-        None,
-        {3: mask_dim},
-    )
+    # Declare `batch` as dynamic when max_bsz > 1; otherwise torch.export
+    # bakes in the example batch size as a static dim and TRT rejects
+    # runtime batches that differ (e.g. compiled bsz=2 but runtime bsz=1)
+    # with: "Static dimension mismatch ... Set [...,1,...] Expected [...,2,...]".
+    # When max_bsz == 1 we leave batch static (matches the original behaviour
+    # and avoids declaring a degenerate Dim with min == max).
+    if max_bsz > 1:
+        batch_dim = torch.export.Dim("batch", min=1, max=max_bsz)
+        dynamic_shapes = (
+            {0: batch_dim},                  # x
+            {0: batch_dim},                  # t
+            {1: batch_dim, 3: prefix_dim},   # prefix_k
+            {1: batch_dim, 3: prefix_dim},   # prefix_v
+            {1: batch_dim},                  # position_ids
+            {0: batch_dim, 3: mask_dim},     # attention_mask
+        )
+    else:
+        dynamic_shapes = (
+            None,
+            None,
+            {3: prefix_dim},
+            {3: prefix_dim},
+            None,
+            {3: mask_dim},
+        )
     return sample_inputs, dynamic_shapes, make_inputs
 
 
@@ -148,12 +166,24 @@ def _export_diffusion_module(
         )
 
 
-def _build_trt_input_specs(make_inputs: callable, min_prefix_len: int, opt_prefix_len: int, max_prefix_len: int):
+def _build_trt_input_specs(
+    make_inputs: callable,
+    min_prefix_len: int,
+    opt_prefix_len: int,
+    max_prefix_len: int,
+    max_batch_size: int,
+):
     import torch_tensorrt
 
-    min_inputs = make_inputs(min_prefix_len)
-    opt_inputs = make_inputs(opt_prefix_len)
-    max_inputs = make_inputs(max_prefix_len)
+    # min: smallest batch (1) and smallest prefix
+    # opt: midpoint of both (favoured by the TRT optimizer)
+    # max: largest batch and largest prefix
+    min_bsz = 1
+    max_bsz = int(max_batch_size)
+    opt_bsz = max(min_bsz, (min_bsz + max_bsz) // 2)
+    min_inputs = make_inputs(min_prefix_len, bsz=min_bsz)
+    opt_inputs = make_inputs(opt_prefix_len, bsz=opt_bsz)
+    max_inputs = make_inputs(max_prefix_len, bsz=max_bsz)
     return [
         torch_tensorrt.Input(
             min_shape=t_min.shape,
@@ -191,7 +221,9 @@ def compile_diffusion_step_no_cache(
 
     exported = _export_diffusion_module(module, sample_inputs, dynamic_shapes)
     opt_prefix_len = (min_prefix_len + max_prefix_len) // 2
-    trt_input_specs = _build_trt_input_specs(make_inputs, min_prefix_len, opt_prefix_len, max_prefix_len)
+    trt_input_specs = _build_trt_input_specs(
+        make_inputs, min_prefix_len, opt_prefix_len, max_prefix_len, batch_size
+    )
     trt_settings = {
         "use_explicit_typing": True,
         "use_fp32_acc": True,
@@ -201,6 +233,7 @@ def compile_diffusion_step_no_cache(
         "debug": debug,
         "allow_complex_guards_as_runtime_asserts": True,
         "offload_module_to_cpu": offload_module_to_cpu,
+        "decompose_attention": True,
     }
     with torch_tensorrt.dynamo.Debugger() if debug else nullcontext():
         trt_step = torch_tensorrt.dynamo.compile(exported, inputs=trt_input_specs, **trt_settings)
@@ -240,7 +273,9 @@ def save_diffusion_engine(
         return False
 
     opt_prefix_len = (min_prefix_len + max_prefix_len) // 2
-    trt_input_specs = _build_trt_input_specs(make_inputs, min_prefix_len, opt_prefix_len, max_prefix_len)
+    trt_input_specs = _build_trt_input_specs(
+        make_inputs, min_prefix_len, opt_prefix_len, max_prefix_len, batch_size
+    )
     trt_settings = {
         "truncate_double": True,
         "min_block_size": 1,
