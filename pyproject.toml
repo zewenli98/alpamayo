@@ -11,12 +11,13 @@ dependencies = [
   "pandas>=2.3.3",
   "physical-ai-av==0.2.0",
   "pillow>=12.0.0",
-  "torch==2.8.0",
-  "torchvision>=0.23.0",
+  "torch==2.11.0",
+  "torchvision>=0.26.0",
   "transformers==4.57.1",
   "flash-attn>=2.8.3",
   "matplotlib>=3.10.7",
   "seaborn>=0.13.2",
+  "nvidia-modelopt==0.43.0",
 ]
 
 [build-system]
