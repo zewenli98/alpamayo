@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
+from types import MethodType
 
 import torch
 import torch.nn as nn
@@ -88,6 +89,68 @@ def _build_diffusion_module(model: nn.Module, dtype: torch.dtype, device: str) -
         head_dim=head_dim,
     )
     return module, cfg
+
+
+def _disable_action_in_proj_first_linear_quantizers(action_in_proj: nn.Module) -> None:
+    """
+    This patch is specifically for the error in AutoQuant (fp8/nvfp4) quantization. 
+    Disable block quantizers on the 60-wide Fourier input that TRT cannot tile by 16.
+    """
+    encoder = getattr(action_in_proj, "encoder", None)
+    trunk = getattr(encoder, "trunk", None)
+    if trunk is None or len(trunk) == 0:
+        return
+
+    first_layer = trunk[0]
+    disabled = []
+    for quantizer_name in ("input_quantizer", "weight_quantizer"):
+        quantizer = getattr(first_layer, quantizer_name, None)
+        disable = getattr(quantizer, "disable", None)
+        if callable(disable):
+            disable()
+            disabled.append(quantizer_name)
+
+    if disabled:
+        logger.info(
+            "Disabled action_in_proj.encoder.trunk.0 %s before TRT diffusion compile",
+            ", ".join(disabled),
+        )
+
+
+def _patch_expert_o_proj_static_last_dim(expert: nn.Module) -> None:
+    """
+    This patch is specifically for the error in AutoQuant (fp8/nvfp4) quantization. 
+    Make expert attention o_proj inputs expose a static hidden dimension to TRT.
+    """
+    patched = 0
+    for layer in getattr(expert, "layers", []):
+        self_attn = getattr(layer, "self_attn", None)
+        o_proj = getattr(self_attn, "o_proj", None)
+        if o_proj is None or getattr(o_proj, "_trt_static_last_dim_patched", False):
+            continue
+
+        in_features = getattr(o_proj, "in_features", None)
+        if in_features is None:
+            weight = getattr(o_proj, "weight", None)
+            if weight is None or len(getattr(weight, "shape", ())) < 2:
+                logger.debug("Skipping expert o_proj static-dim patch; cannot infer in_features for %s", o_proj)
+                continue
+            in_features = int(weight.shape[1])
+        in_features = int(in_features)
+
+        o_proj._trt_original_forward = o_proj.forward
+        o_proj._trt_static_o_proj_in_features = in_features
+
+        def _static_last_dim_forward(self, input: torch.Tensor, *args, **kwargs):
+            target_shape = tuple(input.shape[:-1]) + (self._trt_static_o_proj_in_features,)
+            input = input.reshape(target_shape).contiguous()
+            return self._trt_original_forward(input, *args, **kwargs)
+
+        o_proj.forward = MethodType(_static_last_dim_forward, o_proj)
+        o_proj._trt_static_last_dim_patched = True
+        patched += 1
+
+    logger.info("Patched %d expert self_attn.o_proj module(s) with static last-dim reshape", patched)
 
 
 def _make_sample_inputs(
@@ -210,6 +273,8 @@ def compile_diffusion_step_no_cache(
 
     dtype = torch.float16
     module, cfg = _build_diffusion_module(model, dtype, device)
+    # _disable_action_in_proj_first_linear_quantizers(module.action_in_proj)
+    # _patch_expert_o_proj_static_last_dim(module.expert)
 
     sample_inputs, dynamic_shapes, make_inputs = _make_sample_inputs(
         cfg, min_prefix_len, max_prefix_len, dtype, device, batch_size
@@ -233,7 +298,8 @@ def compile_diffusion_step_no_cache(
         "debug": debug,
         "allow_complex_guards_as_runtime_asserts": True,
         "offload_module_to_cpu": offload_module_to_cpu,
-        "decompose_attention": True,
+        "decompose_attention": False,
+        # "require_full_compilation": True,
     }
     with torch_tensorrt.dynamo.Debugger() if debug else nullcontext():
         trt_step = torch_tensorrt.dynamo.compile(exported, inputs=trt_input_specs, **trt_settings)

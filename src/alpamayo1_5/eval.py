@@ -90,6 +90,77 @@ def read_clip_ids_from_parquet(parquet_path: str) -> list[str]:
     return uniq
 
 
+def print_modelopt_quant_layer_summary(model):
+    """Print enabled/disabled ModelOpt quantizers grouped by owning module."""
+    from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
+
+    def _is_enabled(quantizer: TensorQuantizer) -> bool:
+        is_enabled = getattr(quantizer, "is_enabled", None)
+        if callable(is_enabled):
+            return bool(is_enabled())
+        if is_enabled is not None:
+            return bool(is_enabled)
+
+        disabled = getattr(quantizer, "disabled", None)
+        if disabled is not None:
+            return not bool(disabled)
+
+        disabled = getattr(quantizer, "_disabled", None)
+        if disabled is not None:
+            return not bool(disabled)
+
+        return "disabled" not in repr(quantizer)
+
+    quantizers_by_layer = {}
+    for name, module in model.named_modules():
+        if not isinstance(module, TensorQuantizer):
+            continue
+
+        layer_name, _, quantizer_name = name.rpartition(".")
+        layer_name = layer_name or "<root>"
+        quantizers_by_layer.setdefault(layer_name, []).append(
+            (quantizer_name, _is_enabled(module))
+        )
+
+    quantized_layers = []
+    unquantized_layers = []
+    enabled_quantizers = 0
+    disabled_quantizers = 0
+
+    for layer_name, quantizers in sorted(quantizers_by_layer.items()):
+        num_enabled = sum(enabled for _, enabled in quantizers)
+        enabled_quantizers += num_enabled
+        disabled_quantizers += len(quantizers) - num_enabled
+        if num_enabled > 0:
+            quantized_layers.append((layer_name, quantizers))
+        else:
+            unquantized_layers.append((layer_name, quantizers))
+
+    print("================== ModelOpt quantized layer summary ==================")
+    print(
+        f"Layers with ModelOpt quantizers: {len(quantizers_by_layer)} "
+        f"(quantized: {len(quantized_layers)}, not quantized: {len(unquantized_layers)})"
+    )
+    print(
+        f"Quantizers: {enabled_quantizers + disabled_quantizers} "
+        f"(enabled: {enabled_quantizers}, disabled: {disabled_quantizers})"
+    )
+
+    print("\nQuantized layers:")
+    for layer_name, quantizers in quantized_layers:
+        enabled_names = [name for name, enabled in quantizers if enabled]
+        disabled_names = [name for name, enabled in quantizers if not enabled]
+        print(
+            f"  {layer_name}: enabled={enabled_names}"
+            f"{', disabled=' + str(disabled_names) if disabled_names else ''}"
+        )
+
+    print("\nNot quantized layers with ModelOpt quantizers:")
+    for layer_name, quantizers in unquantized_layers:
+        quantizer_names = [name for name, _ in quantizers]
+        print(f"  {layer_name}: disabled={quantizer_names}")
+
+
 @torch.inference_mode()
 def compute_minade_for_clip_pytorch(
     model: Alpamayo1_5,
@@ -276,7 +347,9 @@ def main():
         )
     else:
         customized_model = True
-        model = Alpamayo1_5.from_pretrained(args.ckpt).to(device=device)
+        model = Alpamayo1_5.from_pretrained(args.ckpt, dtype=torch.float16).to(
+            device=device, dtype=torch.float16
+        )
         import modelopt.torch.quantization as mtq
         mtq.print_quant_summary(model)
     model.eval()
@@ -315,18 +388,19 @@ def main():
         )
 
         if args.quant_format == "auto":
-            model = auto_quantize_model(
-                model,
-                quantization_args,
-                clip_ids=calib_clip_ids,
-                processor=processor,
-                t0_us=args.t0_us,
-                top_p=args.top_p,
-                temperature=args.temperature,
-                max_generation_length=args.max_generation_length,
-                calibration_traj_samples=args.num_traj_samples,
-                device=device,
-            )
+            with torch.enable_grad():
+                model = auto_quantize_model(
+                    model,
+                    quantization_args,
+                    clip_ids=calib_clip_ids,
+                    processor=processor,
+                    t0_us=args.t0_us,
+                    top_p=args.top_p,
+                    temperature=args.temperature,
+                    max_generation_length=args.max_generation_length,
+                    calibration_traj_samples=args.num_traj_samples,
+                    device=device,
+                )
         else:
             model = quantize_model(
                 model,
@@ -334,6 +408,9 @@ def main():
                 calibration_forward_loop=calibration_forward_loop,
             )
         model.eval()
+
+    print_modelopt_quant_layer_summary(model)
+    print(model)
 
     if args.save_model_dir is not None:
         save_dir = os.path.join(args.save_model_dir, f"alpamayo1.5{'_' + str(args.quant_format) if args.quant_format is not None else '_fp16'}{'_' + str(args.auto_quantize_bits) + 'bits' if args.quant_format == 'auto' else ''}{'_weight_only' if args.quant_weight_only else ''}{'_calib' + str(args.num_of_calib_clips) if args.quant_format is not None else ''}")

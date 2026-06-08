@@ -475,6 +475,42 @@ def _fix_requires_output_allocator(trt_backbone: nn.Module) -> None:
     logger.info("Enabled output allocator on %d TRT submodule(s)", fixed)
 
 
+def _patch_lm_o_proj_static_last_dim(language_model: nn.Module) -> None:
+    """
+    This patch is specifically for the error in AutoQuant (fp8/nvfp4) quantization. 
+    Make Qwen text attention o_proj inputs expose a static hidden dimension to TRT.
+    """
+    patched = 0
+    for layer in getattr(language_model, "layers", []):
+        self_attn = getattr(layer, "self_attn", None)
+        o_proj = getattr(self_attn, "o_proj", None)
+        if o_proj is None or getattr(o_proj, "_trt_static_last_dim_patched", False):
+            continue
+
+        in_features = getattr(o_proj, "in_features", None)
+        if in_features is None:
+            weight = getattr(o_proj, "weight", None)
+            if weight is None or len(getattr(weight, "shape", ())) < 2:
+                logger.debug("Skipping o_proj static-dim patch; cannot infer in_features for %s", o_proj)
+                continue
+            in_features = int(weight.shape[1])
+        in_features = int(in_features)
+
+        o_proj._trt_original_forward = o_proj.forward
+        o_proj._trt_static_o_proj_in_features = in_features
+
+        def _static_last_dim_forward(self, input: torch.Tensor, *args, **kwargs):
+            target_shape = tuple(input.shape[:-1]) + (self._trt_static_o_proj_in_features,)
+            input = input.reshape(target_shape).contiguous()
+            return self._trt_original_forward(input, *args, **kwargs)
+
+        o_proj.forward = MethodType(_static_last_dim_forward, o_proj)
+        o_proj._trt_static_last_dim_patched = True
+        patched += 1
+
+    logger.info("Patched %d LM self_attn.o_proj module(s) with static last-dim reshape", patched)
+
+
 def _install_hf_generate_wrapper_adapter(
     model: nn.Module,
     wrapper: nn.Module,
@@ -691,6 +727,7 @@ def compile_vlm_lm_trt_with_cache(
             layer.self_attn._attn_implementation = "sdpa"
         if hasattr(layer.self_attn, "config"):
             layer.self_attn.config._attn_implementation = "sdpa"
+    # _patch_lm_o_proj_static_last_dim(language_model)
 
     wrapper = Qwen3VLTextModelWithCacheWrapper(language_model).to(device=device, dtype=dtype).eval()
     bsz = int(batch_size)
@@ -725,7 +762,8 @@ def compile_vlm_lm_trt_with_cache(
         "debug": debug,
         "allow_complex_guards_as_runtime_asserts": True,
         "offload_module_to_cpu": False,
-        "decompose_attention": True,
+        "decompose_attention": False,
+        # "require_full_compilation": True,
     }
     trt_inputs = [example_attention_mask, example_position_ids, example_embeds, example_past_key_values]
     with torch_tensorrt.dynamo.Debugger() if debug else nullcontext():

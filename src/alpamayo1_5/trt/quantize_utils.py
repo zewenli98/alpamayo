@@ -29,6 +29,19 @@ MAX_BOUND_FP8 = 448.0
 # Additional scaling factor for NVFP4
 MAX_BOUND_NVFP4 = 6.0
 
+FP8_CONFIG = {
+    "quant_cfg": {
+        "*": {"enable": False},
+        "*weight_quantizer": {"num_bits": (4, 3), "axis": None},
+        "*input_quantizer": {"num_bits": (4, 3), "axis": None},
+        "*output_quantizer": {"enable": False},
+        "*[qkv]_bmm_quantizer": {"num_bits": (4, 3), "axis": None},
+        "*softmax_quantizer": {"num_bits": (4, 3), "axis": None},
+        "*bmm2_output_quantizer": {"num_bits": (4, 3), "axis": None},
+    },
+    "algorithm": "max",
+}
+
 
 # def _disable_modelopt_fp8_cuda_extension() -> None:
 #     """
@@ -112,7 +125,8 @@ def quantize_model(model, args, tokenizer=None, calibration_forward_loop=None):
         if args.weight_only:
             quant_cfg = mtq.FP8_2D_BLOCKWISE_WEIGHT_ONLY_CFG
         else:
-            quant_cfg = mtq.FP8_DEFAULT_CFG
+            # quant_cfg = mtq.FP8_DEFAULT_CFG
+            quant_cfg = FP8_CONFIG
     elif args.quant_format == "nvfp4":
         quant_cfg = mtq.NVFP4_DEFAULT_CFG
         quant_cfg["quant_cfg"]["*action_in_proj.encoder.trunk.0.input_quantizer"] = {
@@ -267,7 +281,7 @@ def auto_quantize_model(
         model, search_state = mtq.auto_quantize(
             model,
             constraints={"effective_bits": args.auto_quantize_bits},
-            quantization_formats=["NVFP4_DEFAULT_CFG", "FP8_DEFAULT_CFG"],
+            quantization_formats=["NVFP4_DEFAULT_CFG", FP8_CONFIG],
             data_loader=data_loader,
             forward_step=forward_step,
             loss_func=loss_func,

@@ -43,7 +43,7 @@ def compile_vision_trt(
         model.vlm.model.visual,
         model_inputs,
         device="cuda",
-        debug=False,
+        debug=True,
         offload_module_to_cpu=offload_module_to_cpu,
     )
     if trt_vision is None:
@@ -51,6 +51,7 @@ def compile_vision_trt(
         return None
 
     logger.info("✓ Vision encoder compiled with TRT")
+    print(trt_vision)
     return trt_vision
 
 
@@ -68,7 +69,7 @@ def compile_diffusion_no_cache_trt(
         batch_size=int(batch_size),
         device="cuda",
         offload_module_to_cpu=offload_module_to_cpu,
-        debug=False,
+        debug=True,
         accuracy_check=True,
     )
     if not hasattr(model, "_trt_diffusion_step_no_cache"):
@@ -76,6 +77,7 @@ def compile_diffusion_no_cache_trt(
         return None
     
     logger.info("✓ No-cache diffusion step compiled with TRT")
+    print(model._trt_diffusion_step_no_cache)
     return model._trt_diffusion_step_no_cache
 
 
@@ -96,7 +98,7 @@ def compile_language_trt(
         batch_size=batch_size,
         device="cuda",
         offload_module_to_cpu=offload_module_to_cpu,
-        debug=False,
+        debug=True,
         accuracy_check=True,
     )
     if compiled_model is None:
@@ -107,6 +109,7 @@ def compile_language_trt(
     model._trt_lm_max_batch_size = int(batch_size)
     model._trt_lm_batch_size = int(batch_size)
     logger.info("✓ Language model compiled with TRT")
+    print(model._trt_vlm_backbone)
     return model._trt_vlm_backbone
 
 

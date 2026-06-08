@@ -223,6 +223,30 @@ class _RepeatCollapseVisionWrapper(nn.Module):
         return main_out, deepstack_out
 
 
+def _disable_patch_embed_quantizers(visual_model: nn.Module) -> None:
+    """
+    This patch is specifically for the error in fp8 quantization as below.
+    Disable block quantizers on the patch_embed.proj input that TRT/Myelin has no valid tactic for this FP8 3D patch-embedding conv.
+
+    22:32:34 - ERROR - Error Code: 9: Skipping tactic 0x0000000000000000 due to exception [autotuner.cpp:3296: get_best_tactics] Autotuner: no tactics to implement operation:
+    1254124: corrltn: [CONVOLUTION]-[aten_ops.convolution.default]-[visual.patch_embed.proj/convolution]_output_before_bias.1-(f16[11520,1152,1,1,1][]so[], mem_prop=0, align=2) | [QUANTIZE]-[aten_ops.quantize_op.default]-[visual.patch_embed.proj.input_quantizer/quantize_op_quantize]_output.1-(f8[11520,3,2,16,16][]so[], mem_prop=0, align=1), __mye1267845_dconst-{56, -36, -26, -72, -28, 60, -52, 8, ...}(f8[1152,3,2,16,16][1536,512,256,16,1]so[4,3,2,1,0], mem_prop=0, align=1)<entry>, __mye1266900_folded_replicate-{3.79355e-07, 3.79355e-07, 3.79355e-07, 3.79355e-07, 3.79355e-07, 3.79355e-07, 3.79355e-07, 3.79355e-07, ...}(f32[1,1152,1,1,1][1152,1,1,1,1]so[4,3,2,1,0], mem_prop=0, align=4)<entry>, __mye1266905_folded_replicate-{0, 0, 0, 0, 0, 0, 0, 0, ...}(f32[1,1152,1,1,1][1152,1,1,1,1]so[4,3,2,1,0], mem_prop=0, align=4)<entry>, stream = 0 // [CONVOLUTION]-[aten_ops.c
+    22:32:34 - DEBUG - {ForeignNode[[SHUFFLE]-[aten_ops._reshape_copy.default]-[visual.patch_embed/_reshape_copy]...[ELEMENTWISE]-[aten_ops.addmm.default]-[visual.merger.linear_fc2/addmm_115_add]]} (Myelin[0x80000023]) profiling completed in 18.2946 seconds. Fastest Tactic: 0xd15ea5edd15ea5ed Time: inf
+    22:32:34 - ERROR - IBuilder::buildEngineWithConfig: Error Code 10: Internal Error (Could not find any implementation for node {ForeignNode[[SHUFFLE]-[aten_ops._reshape_copy.default]-[visual.patch_embed/_reshape_copy]...[ELEMENTWISE]-[aten_ops.addmm.default]-[visual.merger.linear_fc2/addmm_115_add]]}. In computeCosts at /_src/optimizer/common/tactic/optimizer.cpp:4265)
+    22:32:34 - ERROR - TRT compilation failed:
+    22:32:35 - ERROR - Vision TRT compilation failed
+    22:32:35 - ERROR - Failed to compile vision model
+    """
+    proj = getattr(getattr(visual_model, "patch_embed", None), "proj", None)
+    if proj is None:
+        return
+    for name in ("input_quantizer", "weight_quantizer"):
+        quantizer = getattr(proj, name, None)
+        disable = getattr(quantizer, "disable", None)
+        if callable(disable):
+            disable()
+    logger.info("Disabled patch_embed.proj quantizers")
+
+
 def _prepare_vision_module(
     visual_model: nn.Module,
     model_inputs: dict[str, Any],
@@ -234,6 +258,7 @@ def _prepare_vision_module(
     visual_model.config._attn_implementation = "sdpa"
     visual_model.config.use_cache = False
     visual_model = visual_model.to(dtype=dtype, device=device).eval()
+    # _disable_patch_embed_quantizers(visual_model)
 
     pixel_values = model_inputs["tokenized_data"]["pixel_values"].to(dtype=dtype, device=device)
     image_grid_thw = model_inputs["tokenized_data"]["image_grid_thw"].to(device=device)
@@ -285,6 +310,8 @@ def compile_vision_model(
         "offload_module_to_cpu": offload_module_to_cpu,
         "use_explicit_typing": True,
         "use_fp32_acc": True,
+        "decompose_attention": False,
+        # "require_full_compilation": True,
     }
 
     try:
